@@ -1,0 +1,31 @@
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
+import { Server } from 'socket.io';
+
+const app=express(); app.use(cors({origin:true})); app.get('/health',(_,res)=>res.json({ok:true,service:'hit-or-miss'}));
+const server=http.createServer(app); const io=new Server(server,{cors:{origin:true,methods:['GET','POST']}});
+const rooms=new Map(); const MAX=8, ROUNDS=5;
+const code=()=>Math.random().toString(36).slice(2,6).toUpperCase();
+const cleanName=s=>String(s||'Player').trim().replace(/\s+/g,' ').slice(0,18)||'Player';
+function pub(room, ownId=null){return {code:room.code,hostId:room.hostId,phase:room.phase,round:room.round,players:[...room.players.values()].map(p=>({id:p.id,name:p.name,score:p.score,connected:p.connected,powerUp:p.powerUp,locked:room.phase==='aiming'&&!!room.choices[p.id]})),deadline:room.deadline,results:room.results,winner:room.winner,ownChoice:ownId?room.choices[ownId]||null:null};}
+function broadcast(room){for(const p of room.players.values())io.to(p.id).emit('state',pub(room,p.id));}
+function sendErr(socket,message){socket.emit('gameError',message)}
+function finishRound(room){if(room.phase!=='aiming')return; room.phase='results';const results=[];const shots=[];
+ for(const [pid,choice] of Object.entries(room.choices)){const p=room.players.get(pid);if(!p?.connected||!choice)continue; const targets=choice.targets||[choice.target]; for(const tid of targets){if(tid&&room.players.has(tid)&&tid!==pid)shots.push({from:pid,to:tid});}}
+ const blocked=new Set(); for(const shot of shots){const target=room.players.get(shot.to);if(target?.powerUp==='Ghost')blocked.add(shot.to);}
+ const shieldUsed=new Set(); for(const shot of shots){const from=room.players.get(shot.from),to=room.players.get(shot.to);let outcome='MISS';if(to&&from&&to.connected&&!blocked.has(to.id)){if(to.powerUp==='Shield'&&!shieldUsed.has(to.id)){outcome='BLOCKED';shieldUsed.add(to.id);to.powerUp=null;}else{outcome='HIT';to.score+=0;from.score+=100;}}results.push({from:shot.from,to:shot.to,outcome,points:outcome==='HIT'?100:0});}
+ for(const p of room.players.values())if(p.powerUp==='Ghost')p.powerUp=null; room.results=results;room.deadline=null;room.choices={};broadcast(room);
+ if(room.round>=ROUNDS){room.phase='finished';const max=Math.max(...[...room.players.values()].map(p=>p.score));room.winner=[...room.players.values()].filter(p=>p.score===max).map(p=>p.name);broadcast(room);}
+ else {setTimeout(()=>{if(room.phase==='results'){room.round++;room.phase='lobby';room.results=[];broadcast(room);}},4500);}
+}
+io.on('connection',socket=>{
+ socket.on('createRoom',({name}={})=>{let c;do{c=code()}while(rooms.has(c));const p={id:socket.id,name:cleanName(name),score:0,connected:true,powerUp:null};const r={code:c,hostId:p.id,players:new Map([[p.id,p]]),phase:'lobby',round:0,deadline:null,choices:{},results:[],winner:null};rooms.set(c,r);socket.join(c);socket.emit('joined',{roomCode:c,playerId:p.id});broadcast(r);});
+ socket.on('joinRoom',({roomCode,name}={})=>{const r=rooms.get(String(roomCode||'').toUpperCase());if(!r)return sendErr(socket,'Room not found. Check the code.');if(r.players.size>=MAX)return sendErr(socket,'This room is full (8 players).');if(r.phase!=='lobby')return sendErr(socket,'The game has already started.');const n=cleanName(name).toLowerCase();if([...r.players.values()].some(p=>p.name.toLowerCase()===n))return sendErr(socket,'That nickname is already taken in this room.');const p={id:socket.id,name:cleanName(name),score:0,connected:true,powerUp:null};r.players.set(p.id,p);socket.join(r.code);socket.emit('joined',{roomCode:r.code,playerId:p.id});broadcast(r);});
+ socket.on('startGame',()=>{const r=[...rooms.values()].find(x=>x.players.has(socket.id));if(!r||r.hostId!==socket.id)return sendErr(socket,'Only the host can start.');if(r.players.size<2)return sendErr(socket,'At least two players are needed.');if(!['lobby','results'].includes(r.phase))return; r.phase='aiming';r.round=r.round||1;r.choices={};r.results=[];r.deadline=Date.now()+15000;const ups=['Shield','Double Shot','Ghost','Ricochet'];for(const p of r.players.values())if(!p.powerUp&&Math.random()<.35)p.powerUp=ups[Math.floor(Math.random()*ups.length)];broadcast(r);setTimeout(()=>finishRound(r),15000);});
+ socket.on('chooseTarget',({targetId}={})=>{const r=[...rooms.values()].find(x=>x.players.has(socket.id));if(!r||r.phase!=='aiming')return sendErr(socket,'Target selection is not open.');if(Date.now()>r.deadline)return sendErr(socket,'The aiming timer has ended.');if(!r.players.has(targetId)||targetId===socket.id)return sendErr(socket,'Choose another player.');r.choices[socket.id]={target:targetId};broadcast(r);});
+ socket.on('usePowerUp',({targetId}={})=>{const r=[...rooms.values()].find(x=>x.players.has(socket.id));const p=r?.players.get(socket.id);if(!r||r.phase!=='aiming'||!p?.powerUp)return sendErr(socket,'No power-up available.');if(p.powerUp==='Double Shot'&&targetId&&r.players.has(targetId)&&targetId!==socket.id){const first=r.choices[socket.id]?.target;if(first&&first!==targetId)r.choices[socket.id]={targets:[first,targetId]};}else if(p.powerUp==='Ricochet'){const other=[...r.players.keys()].filter(id=>id!==socket.id);if(other.length){const first=r.choices[socket.id]?.target||other[0];r.choices[socket.id]={targets:[first,other[Math.floor(Math.random()*other.length)]]};}}else if(p.powerUp==='Shield'||p.powerUp==='Ghost'){/* defensive power stays server-side */}else return sendErr(socket,'Select a target first for Double Shot.');p.powerUp=null;broadcast(r);});
+ socket.on('rematch',()=>{const r=[...rooms.values()].find(x=>x.players.has(socket.id));if(!r||r.phase!=='finished')return;for(const p of r.players.values()){p.score=0;p.powerUp=null;}r.phase='lobby';r.round=0;r.results=[];r.winner=null;r.choices={};broadcast(r);});
+ socket.on('disconnect',()=>{for(const r of rooms.values()){const p=r.players.get(socket.id);if(p){p.connected=false;if(r.hostId===socket.id){const next=[...r.players.values()].find(x=>x.connected);if(next)r.hostId=next.id;}if(r.phase==='lobby'&&!p.connected)r.players.delete(socket.id);broadcast(r);if(r.players.size===0)rooms.delete(r.code);}}});
+});
+const port=process.env.PORT||3001;server.listen(port,'0.0.0.0',()=>console.log(`HIT OR MISS server listening on ${port}`));
